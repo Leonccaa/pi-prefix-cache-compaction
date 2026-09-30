@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Feature: `models` config** restricts the extension to specific models (`id` or `provider/id`; empty = any), for gateways that serve several models from one base URL, e.g. local Qwen through the same proxy as hosted Claude/GPT models that should keep Pi's default compaction.
+- **Fix: warm-up missed the prefix on OpenAI Chat Completions.** The warm-up is built with an empty system prompt, which pi-ai omits, and OpenAI carries the system prompt as leading `system`/`developer` messages rather than a top-level field, so the warm-up request lacked it and diverged from its first token. The captured leading system messages are now restored.
+
 ## 0.5.0 — 2026-10-15
 
 0.4.0 was not published to npm; upgrading from 0.3.x gets both. See README, "Upgrading from 0.3.x".
