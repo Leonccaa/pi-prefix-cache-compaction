@@ -13,6 +13,8 @@ export interface Config {
 	baseUrlIncludes: string[];
 	/** Never apply when the baseUrl contains one of these (hosted APIs have their own caching). */
 	baseUrlExcludes: string[];
+	/** Apply only to these models, as `id` or `provider/id` (empty = any). */
+	models: string[];
 	maxSummaryTokens: number;
 	minSummaryTokens: number;
 	/** Tokens reserved for the appended instruction and chat-template overhead. */
@@ -27,6 +29,7 @@ export const DEFAULT_CONFIG: Config = {
 	providers: [],
 	baseUrlIncludes: [],
 	baseUrlExcludes: ["api.anthropic.com"],
+	models: [],
 	maxSummaryTokens: 16_000,
 	minSummaryTokens: 4_000,
 	promptOverheadTokens: 3_000,
@@ -83,6 +86,7 @@ export function appliesTo(model: ModelLike | undefined, cfg: Config): boolean {
 	if (cfg.baseUrlExcludes.some((s) => s && url.includes(s))) return false;
 	if (cfg.providers.length && !cfg.providers.includes(String(model.provider))) return false;
 	if (cfg.baseUrlIncludes.length && !cfg.baseUrlIncludes.some((s) => url.includes(s))) return false;
+	if (cfg.models.length && !cfg.models.includes(String(model.id)) && !cfg.models.includes(`${model.provider}/${model.id}`)) return false;
 	return true;
 }
 
@@ -549,7 +553,17 @@ export function fileListSuffix(fileOps: { read?: Iterable<string>; edited?: Iter
 export function buildWarmupBody(captured: Record<string, any>, built: Record<string, any>): Record<string, any> {
 	// Everything except `messages` comes from the captured turn, so the warmed prefix is the
 	// one the next real turn will send. A 1-token cap is fine: the server stops at max_tokens.
-	const body: Record<string, any> = { ...captured, messages: built.messages, stream: built.stream ?? true };
+	// OpenAI Chat Completions carries the system prompt as leading messages, and the warm-up
+	// is built with an empty system prompt (pi-ai then omits it), so restore them from the
+	// capture; without them the warm-up misses from its first token.
+	const builtMessages: any[] = Array.isArray(built.messages) ? built.messages : [];
+	const leadingSystem: any[] = [];
+	for (const m of Array.isArray(captured.messages) ? captured.messages : []) {
+		if (!isSystemRole(m)) break;
+		leadingSystem.push(m);
+	}
+	const messages = builtMessages.length && isSystemRole(builtMessages[0]) ? builtMessages : [...leadingSystem, ...builtMessages];
+	const body: Record<string, any> = { ...captured, messages, stream: built.stream ?? true };
 	setMaxTokens(body, captured, 1);
 	for (const key of PROMPT_AFFECTING_KEYS) {
 		if (key !== "messages") body[key] = captured[key];

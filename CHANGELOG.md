@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 — unreleased
+
+- **Fix: warm-up missed the prefix on OpenAI Chat Completions.** The warm-up is built with an empty system prompt, which pi-ai omits, and OpenAI carries the system prompt as leading `system`/`developer` messages rather than a top-level field, so the warm-up request lacked it and diverged from its first token. The captured leading system messages are now restored.
+- **Feature: `models` config** restricts the extension to specific models (`id` or `provider/id`), for gateways that serve several models from one base URL.
+
 ## 0.3.0 — 2026-09-20
 
 - **Fix: compaction 401 on authenticated endpoints** ([#2](https://github.com/jagdeepsinghdev/pi-prefix-cache-compaction/issues/2)). `before_provider_headers` runs before Pi hands the API key to the SDK, so the captured header map never contained a credential unless `authHeader: true` was set. The summary request now resolves auth at request time via `ctx.modelRegistry.getApiKeyAndHeaders` and attaches the key the way the SDK does (`x-api-key` for Anthropic Messages, `Authorization: Bearer` for OpenAI and OAuth-style tokens), layered over the captured routing headers; a resolved `baseUrl` is preferred over `model.baseUrl`. A missing credential is reported as `auth: …` instead of an HTTP 401.

@@ -51,6 +51,14 @@ test("appliesTo: anthropic-messages and openai-completions local servers by defa
 	assert.equal(appliesTo(local, mergeConfig({ baseUrlIncludes: [":9999"] })), false);
 });
 
+test("appliesTo: models matches id or provider/id", () => {
+	const m = { provider: "gw", id: "big", api: "openai-completions", baseUrl: "http://gw:1/v1" };
+	assert.equal(appliesTo(m, mergeConfig({ models: ["big"] })), true);
+	assert.equal(appliesTo(m, mergeConfig({ models: ["gw/big"] })), true);
+	assert.equal(appliesTo(m, mergeConfig({ models: ["other", "gw/small"] })), false);
+	assert.equal(appliesTo(m, mergeConfig({ models: [] })), true);
+});
+
 test("isCapturable: real turns yes, Pi's fallback summarizer and empty payloads no", () => {
 	assert.equal(isCapturable({ system: "You are pi", messages: [{ role: "user", content: "hi" }] }), true);
 	assert.equal(
@@ -289,6 +297,16 @@ test("buildWarmupBody (openai-completions): 1 token in the captured cap field", 
 	const body = buildWarmupBody({ model: "m", messages: [{ role: "user", content: "old" }], max_completion_tokens: 5000 }, { messages: [{ role: "user", content: "new" }] });
 	assert.equal(body.max_completion_tokens, 1);
 	assert.equal(body.max_tokens, undefined);
+});
+
+test("buildWarmupBody (openai-completions): captured leading system messages are restored", () => {
+	const system = { role: "system", content: "S" };
+	const captured = { model: "m", messages: [system, { role: "developer", content: "D" }, { role: "user", content: "old" }, { role: "system", content: "late" }] };
+	const built = buildWarmupBody(captured, { messages: [{ role: "user", content: "new" }] });
+	assert.deepEqual(built.messages, [system, { role: "developer", content: "D" }, { role: "user", content: "new" }]);
+	// A builder that already rendered a system prompt is left alone.
+	const own = buildWarmupBody(captured, { messages: [{ role: "system", content: "X" }, { role: "user", content: "new" }] });
+	assert.deepEqual(own.messages, [{ role: "system", content: "X" }, { role: "user", content: "new" }]);
 });
 
 const chat = (...chunks: Array<object | string>) => chunks.map((c) => `data: ${typeof c === "string" ? c : JSON.stringify(c)}\n\n`).join("");
