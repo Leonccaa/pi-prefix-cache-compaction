@@ -1,0 +1,45 @@
+{
+  "name": "incremental",
+  "description": "incremental compaction vs full re-summary, direct to one inference server",
+  "endpoint": {
+    "provider": "my-provider",
+    "model": "my-model",
+    "baseUrl": "http://127.0.0.1:8000",
+    "modelId": "my-served-model-name",
+    "apiKeyEnv": "LLM_API_KEY"
+  },
+  "session": {
+    "cycles": 3,
+    "rows": 600,
+    "thinking": "off",
+    "warmup": false,
+    "persist": false
+  },
+  "arms": [
+    {
+      "name": "baseline",
+      "config": {
+        "incremental": false
+      }
+    },
+    {
+      "name": "incremental",
+      "config": {
+        "incremental": true
+      }
+    }
+  ],
+  "repeats": 3,
+  "compare": {
+    "baseline": "baseline",
+    "candidate": "incremental"
+  },
+  "accept": {
+    "viaExtension": true,
+    "incrementalWiring": true,
+    "noLostFacts": true,
+    "faster": true,
+    "minTimeGainPct": 10,
+    "minTokenGainPct": 10
+  }
+}

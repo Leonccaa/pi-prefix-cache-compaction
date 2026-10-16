@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.5.0 — 2026-10-15
+
+0.4.0 was not published to npm; upgrading from 0.3.x gets both. See README, "Upgrading from 0.3.x".
+
+
+- **Background compaction** (`background`, experimental, off by default; `backgroundAt`, default 0.7). After the first turn past `backgroundAt` × context window, the captured request is summarized in the background while the session keeps working. When Pi auto-compacts at its threshold, that summary is returned immediately and every entry after the summarized request is kept verbatim. Not used when summary + kept tail would exceed 60 % of the window; `/compact <instructions>` always takes the normal path.
+  - **Pre-warm.** The post-compaction context (system, summary, kept entries) is warmed as soon as the summary is ready and extended after every turn, so the first request after the compaction starts from cache. If a pre-warm is in flight when Pi compacts, the compaction waits for it; there is no warm-up after the compaction in this mode, unless nothing was pre-warmed and Pi is idle. Found live: the first pre-release version warmed *after* the compaction, in parallel with the next request, and that request then prefilled ~92k tokens cold (51 s in a real session).
+  - The summary is stored without the file-list suffix in this mode (it would change the pre-warmed prefix).
+  - `scripts/background-smoke.mjs` on vLLM Qwen3.8-27B, Pi's threshold auto-compaction at ~49k tokens, compaction start to first reply: 86.2 s with `background: false`, 24.4 s without pre-warm, **7.2 s** with it (3.0 s compaction + 4.2 s reply, 88 % from cache). DeepSeek, both wire formats: compaction 3–4 ms. Planted facts survived in every run.
+  - **Fix (found live): Pi crashed after `/reload`.** Background work that finished after a reload or session switch updated the pill through the stale ctx; Pi throws on that, and the exception escaped a fire-and-forget promise and exited the process. All UI and notification calls are now guarded, and no background promise can reject unhandled. Regression test: `scripts/stale-ctx-smoke.mjs` (compact, replace the session while the background work runs, check Pi still answers): exit code 1 before, alive after.
+  - `PI_PREFIX_CACHE_DUMP=<dir>` writes every real request and warm-up body to `<dir>` for diffing.
+  - Live session (Qwen3.8-27B, xhigh, 262k window): background summary of 184,358 tokens (182,400 from prefix cache, 5,180 out) in 120 s; live turns during it kept a 98–99 % cache hit. Pi's auto-compaction at 231,076 tokens took 0.1 s and kept 63 entries verbatim. With pre-warm: compaction at 234,417 tokens, first request after it 95,394 tokens with 97 % from cache (the size the last pre-warm covered).
+- **Status pill** in Pi's footer (`statusBar`, on by default): spinner with elapsed time and an approximate output count during the summary, background summary and warm-up; green or amber result afterwards. Colors from the active theme.
+- **Notifications** for each background step: start, ready (seconds, tokens in, from cache, out), still running when Pi compacts, out of date, failed.
+- `/prefix-compaction` shows background summaries started / used and the last error.
+- Tests: 39 unit tests (new: `backgroundAt` clamping, summary + kept-tail fit).
+
+## 0.4.0 — 2026-10-03
+
+- **Fix: compaction right after resume fell back to Pi's default** ("no captured request yet in this process"). New `persist` option, on by default: the last captured request per session is also written to `~/.pi/agent/cache/pi-prefix-cache-compaction/` (debounced, flushed on shutdown, credential headers stripped, 14-day pruning). A compaction before the first turn of a resumed process replays that request, which is the prefix the server still has cached. The file is dropped after every compaction. Verified live with the new `scripts/resume-smoke.mjs` against vLLM Qwen3.8-27B: resumed process compacted 103,023 tokens through the extension in 16 s with 97,600 prompt tokens from the prefix cache; the same run with `persist: false` produced the old fallback.
+- **Fix: a stalled summary stream hung "Auto-compacting" forever.** The summary request had no timeout at all (`setTimeout(0)`). Seen behind LiteLLM: the upstream stream ended at 109 s but the proxy kept Pi's socket open for 25+ minutes. It now gives up after 600 s with no bytes (long enough for a cold 230k-token prefill) and Pi's default runs.
+- **Shorter summaries.** Both summary prompts now ask for about 1,000–1,500 words and to drop detail no longer needed. On a local GPU the summary is generated at ~20–50 tok/s, and real sessions were producing 15–27k-character summaries (3–9k tokens incl. reasoning), i.e. 1–7 minutes per compaction. The prompt is appended after the cached prefix, so the cache hit is unaffected.
+- **Experimental: incremental compaction** (`incremental`, off by default, Pi ≥ 0.99). From the second compaction on, the previous summary plus an update instruction is appended so the model merges the new delta instead of re-summarizing everything; the merged summary is carried forward in the compaction entry's `details`. Mechanism proven by unit tests (fake-server two-compaction end-to-end, byte-identical prefix) and against Pi 0.99.1's real `prepareCompaction()`, and now live with the new config-driven runner (`scripts/experiment.mjs experiments/incremental.json`) (Pi 0.99.2, vLLM Qwen3.8-27B on 2× RTX 3090, 3 cycles, ~52–59k-token contexts, thinking off). All four checks passed: every compaction went through the extension; compactions 2–3 were really incremental (notice + `details.previousSummary`); all three planted facts survived (fact 1 through three summaries) in both modes; and incremental was faster over compactions 2–3:
+
+  | compaction | baseline | incremental |
+  |---|---|---|
+  | 1 (identical in both modes) | 33 s, 2,523 tok | 33 s, 2,417 tok |
+  | 2 | 52 s, 4,058 tok | **23 s, 1,501 tok** |
+  | 3 | 33 s, 2,595 tok | 50 s, 3,912 tok |
+  | **2–3 total** | **85 s, 6,653 tok** | **73 s, 5,413 tok (−14 % time, −19 % tokens)** |
+
+  A second run with the config-driven runner went the other way (incremental 56 s / 3,949 tok vs baseline 39 s / 2,802 tok over compactions 2–3), and even the identical compaction 1 varied 34 s → 70 s between runs. Run-to-run variance in summary length is larger than the effect, so **the speed benefit is unproven**; correctness (no lost facts in its runs, real incremental wiring) is shown. It stays opt-in until `experiments/incremental.json` passes with repeats.
+- Tests: 37 unit tests (persist round-trip and credential stripping, persist default, idle-timeout abort); new live scripts `resume-smoke.mjs` and the config-driven experiment runner `experiment.mjs` with `experiments/*.json`.
+
 ## 0.3.0 — 2026-09-20
 
 - **Fix: compaction 401 on authenticated endpoints** ([#2](https://github.com/jagdeepsinghdev/pi-prefix-cache-compaction/issues/2)). `before_provider_headers` runs before Pi hands the API key to the SDK, so the captured header map never contained a credential unless `authHeader: true` was set. The summary request now resolves auth at request time via `ctx.modelRegistry.getApiKeyAndHeaders` and attaches the key the way the SDK does (`x-api-key` for Anthropic Messages, `Authorization: Bearer` for OpenAI and OAuth-style tokens), layered over the captured routing headers; a resolved `baseUrl` is preferred over `model.baseUrl`. A missing credential is reported as `auth: …` instead of an HTTP 401.

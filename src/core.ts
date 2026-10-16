@@ -20,6 +20,33 @@ export interface Config {
 	/** After compaction, send a 1-token request with the new context so the next turn starts warm. */
 	warmup: boolean;
 	notify: boolean;
+	/** Live, colored status pill in Pi's footer while a compaction or warm-up runs. */
+	statusBar: boolean;
+	/**
+	 * Incremental summaries (Pi >= 0.99 only). From the second compaction on, Pi hands us
+	 * preparation.previousSummary plus a messagesToSummarize window that EXCLUDES the
+	 * pre-compaction history, so the replayed request prefix is already delta-sized. We
+	 * append a <previous-summary> message and the update instruction, and store the
+	 * resulting delta summary in the compaction entry's `details` for the next cycle.
+	 * Off by default: on/off is the A/B axis (see scripts/bench-cycles.mjs).
+	 */
+	incremental: boolean;
+	/**
+	 * Keep the last captured request on disk (agent dir, `cache/pi-prefix-cache-compaction/`)
+	 * so a compaction that fires right after `pi -c` / resume, before any new turn, can still
+	 * replay the prefix the previous process left in the server cache.
+	 */
+	persist: boolean;
+	/**
+	 * Background pre-summarization: once a real request reaches `backgroundAt` x contextWindow,
+	 * summarize it right after its turn, while the session keeps working. When Pi's
+	 * auto-compaction fires, that summary is returned at once and every entry after the
+	 * summarized request is kept verbatim, so the compaction itself does not wait on the model.
+	 * The post-compaction warm-up also runs without blocking. Off by default (experimental).
+	 */
+	background: boolean;
+	/** Fraction of the context window at which the background summary starts (0.3 to 0.95). */
+	backgroundAt: number;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -32,6 +59,11 @@ export const DEFAULT_CONFIG: Config = {
 	promptOverheadTokens: 3_000,
 	warmup: true,
 	notify: true,
+	statusBar: true,
+	incremental: false,
+	persist: true,
+	background: false,
+	backgroundAt: 0.7,
 };
 
 export function mergeConfig(...layers: Array<Partial<Config> | undefined>): Config {
@@ -186,6 +218,41 @@ function hasConversationTag(content: unknown): boolean {
  * would disable capture for a whole session as soon as any turn quotes the literal tag —
  * and a session that discusses this extension does exactly that.
  */
+/** On-disk capture (persist mode). Credentials are never written; auth is resolved per request. */
+export interface StoredCapture {
+	v: 1;
+	sessionId: string;
+	modelKey?: string;
+	payload: Record<string, any>;
+	headers?: Record<string, unknown>;
+	savedAt: number;
+}
+
+const SECRET_HEADERS = new Set(["authorization", "x-api-key", "api-key", "cookie", "proxy-authorization"]);
+
+export function captureFileName(sessionId: string): string {
+	return `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.json`;
+}
+
+export function serializeCapture(sessionId: string, cap: { payload: Record<string, any>; headers?: Record<string, unknown>; modelKey?: string }, now = Date.now()): string {
+	const headers: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(cap.headers ?? {})) if (!SECRET_HEADERS.has(k.toLowerCase())) headers[k] = v;
+	const stored: StoredCapture = { v: 1, sessionId, modelKey: cap.modelKey, payload: cap.payload, headers, savedAt: now };
+	return JSON.stringify(stored);
+}
+
+/** Parse a stored capture; anything malformed, for another session, or not replayable -> undefined. */
+export function parseStoredCapture(text: string, sessionId: string): StoredCapture | undefined {
+	let d: any;
+	try {
+		d = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!d || d.v !== 1 || d.sessionId !== sessionId || !isCapturable(d.payload)) return undefined;
+	return d as StoredCapture;
+}
+
 export function isCapturable(payload: unknown): payload is Record<string, any> {
 	if (!payload || typeof payload !== "object") return false;
 	const p = payload as Record<string, any>;
@@ -200,6 +267,26 @@ export function summaryTokenBudget(contextWindow: number, tokensBefore: number, 
 	const room = contextWindow - tokensBefore - cfg.promptOverheadTokens;
 	const budget = Math.min(cfg.maxSummaryTokens, room);
 	return budget >= cfg.minSummaryTokens ? budget : undefined;
+}
+
+/** Context size (tokens) at which a background summary should start. */
+export function backgroundStartTokens(contextWindow: number, cfg: Config): number {
+	const at = Number.isFinite(cfg.backgroundAt) ? Math.min(0.95, Math.max(0.3, cfg.backgroundAt)) : DEFAULT_CONFIG.backgroundAt;
+	return Math.floor(contextWindow * at);
+}
+
+/** Largest post-compaction context a background summary may leave (summary + kept tail). */
+export const BACKGROUND_MAX_AFTER = 0.6;
+
+/**
+ * Whether a background summary taken at `tokensAtSummary` is still worth using now: the
+ * entries after it are kept verbatim, so summary + that tail must leave clear room or Pi
+ * would compact again right away. Summary size is estimated at ~4 chars per token.
+ */
+export function backgroundFits(contextWindow: number, tokensNow: number, tokensAtSummary: number, summaryChars: number): boolean {
+	if (contextWindow <= 0) return false;
+	const tail = Math.max(0, tokensNow - tokensAtSummary);
+	return tail + Math.ceil(summaryChars / 4) <= contextWindow * BACKGROUND_MAX_AFTER;
 }
 
 // Pi's SUMMARIZATION_PROMPT (core/compaction/compaction.js), adapted: the history is the
@@ -237,7 +324,16 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages. Keep any reasoning brief. Output ONLY the summary.`;
+Keep each section concise: aim for about 1,000-1,500 words in total and drop detail that is no longer needed to continue. Preserve exact file paths, function names, and error messages. Keep any reasoning brief. Output ONLY the summary.`;
+
+/**
+ * Incremental-update instruction (incremental mode, Pi >= 0.99). Mirrors Pi's own
+ * UPDATE_SUMMARIZATION_PROMPT (compaction.js): the model is told the messages above are
+ * NEW, to be merged into the <previous-summary> block — not a fresh summary of history.
+ */
+export const UPDATE_SUMMARY_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+STOP. Do not continue the task and do not call any tools. Merge the new messages into the existing summary: PRESERVE everything still relevant, move finished items to Done, update Next Steps. Keep the same EXACT section format as the existing summary (Goal / Constraints & Preferences / Progress with Done-In Progress-Blocked / Key Decisions / Next Steps / Critical Context). Keep each section concise: aim for about 1,000-1,500 words in total and drop detail that is no longer needed to continue. Preserve exact file paths, function names, and error messages. Keep any reasoning brief. Output ONLY the updated summary.`;
 
 /**
  * The captured request, unchanged up to its last message, plus one instruction.
@@ -245,12 +341,32 @@ Keep each section concise. Preserve exact file paths, function names, and error 
  * The summary therefore runs at whatever thinking level the session itself uses; there is
  * deliberately no option to change it (see PROMPT_AFFECTING_KEYS).
  */
-export function buildSummaryBody(captured: Record<string, any>, maxTokens: number, api: WireApi = "anthropic-messages"): Record<string, any> {
-	const instruction =
-		api === "openai-completions" ? { role: "user", content: SUMMARY_PROMPT } : { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT }] };
-	const body: Record<string, any> = { ...captured, messages: [...captured.messages, instruction], stream: true };
+/**
+ * The previous-summary message + update instruction appended for incremental compaction.
+ * Mirrors Pi's own construction (compaction.js:generateSummaryWithUsage): a
+ * <previous-summary> block followed by the update prompt, so the model merges the delta
+ * into the existing summary instead of re-summarizing the whole history. Two appended
+ * messages keep the replayed prefix byte-for-byte identical (the cache hit is about the
+ * prefix; the appended tail is tiny either way).
+ */
+export function incrementalMessages(previousSummary: string, api: WireApi): Array<Record<string, any>> {
+	const wrap = (t: string) => (api === "openai-completions" ? t : [{ type: "text", text: t }]);
+	return [{ role: "user", content: wrap(`<previous-summary>\n${previousSummary}\n</previous-summary>`) }, { role: "user", content: wrap(UPDATE_SUMMARY_PROMPT) }];
+}
+
+/**
+ * The captured request, unchanged up to its last message, plus the appended instruction(s).
+ * Identical prefix => the server's prefix cache covers everything but the instruction.
+ * The summary therefore runs at whatever thinking level the session itself uses; there is
+ * deliberately no option to change it (see PROMPT_AFFECTING_KEYS).
+ * previousSummary (incremental mode, Pi >= 0.99): the prior compaction's summary, appended
+ * as a <previous-summary> message ahead of the update instruction.
+ */
+export function buildSummaryBody(captured: Record<string, any>, maxTokens: number, api: WireApi = "anthropic-messages", previousSummary?: string): Record<string, any> {
+	const appended = previousSummary ? incrementalMessages(previousSummary, api) : [api === "openai-completions" ? { role: "user", content: SUMMARY_PROMPT } : { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT }] }];
+	const body: Record<string, any> = { ...captured, messages: [...captured.messages, ...appended], stream: true };
 	setMaxTokens(body, captured, maxTokens);
-	assertPrefixPreserved(captured, body, 1);
+	assertPrefixPreserved(captured, body, appended.length);
 	return body;
 }
 
@@ -564,7 +680,9 @@ export class HttpStatusError extends Error {}
  * response that sends no bytes for 300 s ("terminated"), which is exactly what a long
  * prefill or thinking phase on a local server looks like. Aborts only on `signal`.
  */
-export function streamMessages(url: string, headers: Record<string, string>, body: string, sse: StreamCollector, signal: AbortSignal) {
+export const STREAM_IDLE_MS = 600_000;
+
+export function streamMessages(url: string, headers: Record<string, string>, body: string, sse: StreamCollector, signal: AbortSignal, idleMs = STREAM_IDLE_MS) {
 	return new Promise<SseResult>((resolve, reject) => {
 		const u = new URL(url);
 		const send = u.protocol === "https:" ? httpsRequest : httpRequest;
@@ -590,7 +708,10 @@ export function streamMessages(url: string, headers: Record<string, string>, bod
 			});
 			res.on("error", reject);
 		});
-		req.setTimeout(0);
+		// Bounded, not 0: a stream the proxy stops relaying without closing (seen 2026-10-02:
+		// router->vLLM ended at 109 s, LiteLLM kept Pi's socket open 25+ min) hung Pi's
+		// "Auto-compacting" forever. 600 s of total silence still covers a cold 230k prefill.
+		req.setTimeout(idleMs, () => req.destroy(new Error(`no data from server for ${idleMs / 1000}s`)));
 		const onAbort = () => req.destroy(new Error("aborted"));
 		// The error listener must exist before the pre-abort check: req.destroy(err) emits
 		// 'error' asynchronously, and with no listener that is an uncaught exception that

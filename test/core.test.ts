@@ -7,8 +7,11 @@ import {
 	ChatCompletionsCollector,
 	createCollector,
 	DEFAULT_CONFIG,
+	backgroundFits,
+	backgroundStartTokens,
 	endpointUrl,
 	fileListSuffix,
+	incrementalMessages,
 	isCapturable,
 	mergeConfig,
 	modelKey,
@@ -19,6 +22,7 @@ import {
 	SseCollector,
 	SummaryError,
 	SUMMARY_PROMPT,
+	UPDATE_SUMMARY_PROMPT,
 	summaryTokenBudget,
 	systemText,
 	toPiUsage,
@@ -537,4 +541,191 @@ test("streamMessages: an already-aborted signal rejects instead of crashing the 
 	const ac = new AbortController();
 	ac.abort();
 	await assert.rejects(streamMessages("http://127.0.0.1:9/v1/messages", {}, "{}", new SseCollector(), ac.signal), /aborted/);
+});
+
+// ── incremental mode (0.4.0, Pi >= 0.99) ─────────────────────────────────────
+
+test("mergeConfig: incremental defaults to false and is toggleable", () => {
+	assert.equal(DEFAULT_CONFIG.incremental, false, "off by default — 0.3.0 behavior is the fallback");
+	assert.equal(mergeConfig({ incremental: true }).incremental, true);
+	assert.equal(mergeConfig({ incremental: "yes" as any }).incremental, false, "wrong type rejected");
+});
+
+test("buildSummaryBody incremental: prefix untouched, previous-summary + update instruction appended", () => {
+	const captured = {
+		model: "m",
+		system: [{ type: "text", text: "sys" }],
+		tools: [{ name: "read" }],
+		messages: [
+			{ role: "user", content: "delta turn 1" },
+			{ role: "assistant", content: "reply 1" },
+		],
+		thinking: { type: "adaptive" },
+		output_config: { effort: "xhigh" },
+		stream: true,
+		max_tokens: 32000,
+	};
+	const snapshot = structuredClone(captured);
+	const prev = "## Goal\nthe earlier work\n## Progress\n### Done\n- [x] first phase";
+	const body = buildSummaryBody(captured, 9000, "anthropic-messages", prev);
+	assert.deepEqual(captured, snapshot, "captured payload must not be mutated");
+	// the replayed prefix is byte-for-byte the captured messages (the cache hit)
+	assert.deepEqual(body.messages.slice(0, 2), captured.messages);
+	// two appended messages: the previous summary, then the update instruction
+	assert.equal(body.messages.length, 4);
+	assert.equal(body.messages[2].content[0].text, `<previous-summary>\n${prev}\n</previous-summary>`);
+	assert.equal(body.messages[3].content[0].text, UPDATE_SUMMARY_PROMPT);
+	// everything prompt-affecting still verified against the capture
+	assert.doesNotThrow(() => assertPrefixPreserved(captured, body, 2));
+	assert.deepEqual(body.thinking, { type: "adaptive" });
+});
+
+test("buildSummaryBody incremental (openai-completions): string-content messages", () => {
+	const captured = {
+		model: "m",
+		messages: [
+			{ role: "system", content: "sys" },
+			{ role: "user", content: "delta" },
+		],
+		stream: true,
+		max_tokens: 1000,
+	};
+	const body = buildSummaryBody(captured, 500, "openai-completions", "PREV-SUMMARY");
+	assert.deepEqual(body.messages.slice(0, 2), captured.messages);
+	assert.equal(body.messages[2].content, "<previous-summary>\nPREV-SUMMARY\n</previous-summary>");
+	assert.equal(body.messages[3].content, UPDATE_SUMMARY_PROMPT);
+	assert.doesNotThrow(() => assertPrefixPreserved(captured, body, 2));
+});
+
+test("incrementalMessages: content shape per wire format", () => {
+	const a = incrementalMessages("P", "anthropic-messages");
+	assert.equal(a[0].content[0].text, "<previous-summary>\nP\n</previous-summary>");
+	assert.equal(a[1].content[0].text, UPDATE_SUMMARY_PROMPT);
+	const o = incrementalMessages("P", "openai-completions");
+	assert.equal(o[0].content, "<previous-summary>\nP\n</previous-summary>");
+	assert.equal(o[1].content, UPDATE_SUMMARY_PROMPT);
+});
+
+test("buildSummaryBody without previousSummary: unchanged 0.3.0 shape (regression guard)", () => {
+	const captured = { model: "m", messages: [{ role: "user", content: "a" }], max_tokens: 9, stream: true };
+	const body = buildSummaryBody(captured, 500, "anthropic-messages", undefined);
+	assert.equal(body.messages.length, 2, "exactly one instruction appended, as before");
+	assert.equal(body.messages[1].content[0].text, SUMMARY_PROMPT);
+});
+
+test("end-to-end: two compactions through a fake server, incremental merges the delta", async () => {
+	// The fake server records each summary request's appended messages and returns a
+	// fixed merged summary. This proves the MECHANISM of incremental compaction:
+	//   cycle 1 (no previousSummary) -> body appends 1 message (the plain instruction)
+	//   cycle 2 (previousSummary set) -> body appends 2 messages: <previous-summary>
+	//     then the update instruction; the replayed prefix (captured messages) is
+	//     identical in both, which is what the server's prefix cache covers.
+	// The summary output of cycle 1 becomes the previousSummary of cycle 2 — the exact
+	// chain prepareCompaction() feeds on Pi >= 0.99.
+	const seen: Array<{ total: number; prev?: string; prefix: unknown }> = [];
+	const sse = (...events: object[]) => events.map((e) => `event: x\ndata: ${JSON.stringify(e)}\n\n`).join("");
+	const stream = () =>
+		sse(
+			{ type: "message_start", message: { id: "1", usage: { input_tokens: 10, output_tokens: 0 } } },
+			{ type: "content_block_delta", delta: { type: "text_delta", text: "## Goal\nmerged delta" } },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 7 } },
+			{ type: "message_stop" },
+		);
+	const srv = await (async () => {
+		const { createServer } = await import("node:http");
+		const s = createServer((req, res) => {
+			let data = "";
+			req.on("data", (c) => (data += c));
+			req.on("end", () => {
+				const p = JSON.parse(data);
+				const withPrev = p.messages.map((m: any) => (Array.isArray(m.content) ? m.content[0]?.text : m.content)).find((t) => typeof t === "string" && t.includes("<previous-summary>"));
+				seen.push({ total: p.messages.length, prev: withPrev, prefix: JSON.parse(JSON.stringify(p.messages.slice(0, 2))) });
+				res.writeHead(200, { "content-type": "text/event-stream" });
+				res.write(stream());
+				res.end();
+			});
+		});
+		await new Promise<void>((r) => s.listen(0, "127.0.0.1", () => r()));
+		return { url: `http://127.0.0.1:${(s.address() as any).port}`, close: () => new Promise<void>((r) => s.close(() => r())) };
+	})();
+	try {
+		// cycle 1: no previous summary; the captured payload is the full history so far
+		const cap1 = { model: "m", system: [{ type: "text", text: "sys" }], messages: [{ role: "user", content: "work 1" }, { role: "assistant", content: "done 1" }], stream: true, max_tokens: 32000 };
+		await streamMessages(srv.url, requestHeaders("anthropic-messages", {}, { apiKey: "k" }), JSON.stringify(buildSummaryBody(cap1, 9000, "anthropic-messages")), createCollector("anthropic-messages"), new AbortController().signal);
+
+		// Pi stores that summary; the NEXT compaction's preparation carries it as
+		// previousSummary and a DELTA-only messagesToSummarize window (boundaryStart).
+		const summary1 = "## Goal\nmerged delta";
+		const cap2 = { model: "m", system: [{ type: "text", text: "sys" }], messages: [{ role: "user", content: "work 2" }, { role: "assistant", content: "done 2" }], stream: true, max_tokens: 32000 };
+		await streamMessages(srv.url, requestHeaders("anthropic-messages", {}, { apiKey: "k" }), JSON.stringify(buildSummaryBody(cap2, 9000, "anthropic-messages", summary1)), createCollector("anthropic-messages"), new AbortController().signal);
+
+		assert.equal(seen.length, 2);
+		// cycle 1: 2 captured + 1 appended (the plain instruction), no previous-summary
+		assert.equal(seen[0].total, 3);
+		assert.equal(seen[0].prev, undefined);
+		// cycle 2: 2 captured + 2 appended; the second carries the previous summary
+		assert.equal(seen[1].total, 4);
+		assert.equal(seen[1].prev, `<previous-summary>\n${summary1}\n</previous-summary>`);
+		// both cycles keep their own delta prefix intact (the replayed, cacheable part)
+		assert.deepEqual(seen[0].prefix, cap1.messages);
+		assert.deepEqual(seen[1].prefix, cap2.messages);
+	} finally {
+		await srv.close();
+	}
+});
+
+import { captureFileName, parseStoredCapture, serializeCapture } from "../src/core.ts";
+
+test("persist: stored capture round-trips, never writes credentials, rejects other sessions and junk", () => {
+	const payload = { model: "m", system: "sys", messages: [{ role: "user", content: "hi" }] };
+	const text = serializeCapture("s-1", { payload, modelKey: "k", headers: { "x-session-id": "s-1", Authorization: "Bearer x", "x-api-key": "y", cookie: "c" } }, 5);
+	assert.doesNotMatch(text, /Bearer x|"y"|cookie/i);
+	const back = parseStoredCapture(text, "s-1");
+	assert.deepEqual(back?.payload, payload);
+	assert.equal(back?.modelKey, "k");
+	assert.deepEqual(back?.headers, { "x-session-id": "s-1" });
+	assert.equal(parseStoredCapture(text, "s-2"), undefined, "a file for another session is ignored");
+	assert.equal(parseStoredCapture("{not json", "s-1"), undefined);
+	assert.equal(parseStoredCapture(JSON.stringify({ v: 1, sessionId: "s-1", payload: { messages: [] } }), "s-1"), undefined, "unreplayable payload");
+	assert.equal(captureFileName("../a/b c"), "___a_b_c.json", "no path traversal");
+});
+
+test("mergeConfig: persist defaults to true and is toggleable", () => {
+	assert.equal(mergeConfig().persist, true);
+	assert.equal(mergeConfig({ persist: false }).persist, false);
+});
+
+test("streamMessages: a stream that goes silent is abandoned after the idle limit instead of hanging", async () => {
+	const srv = await fakeServer((_req, _body, res) => {
+		res.writeHead(200, { "content-type": "text/event-stream" });
+		res.write(sse({ type: "message_start", message: { usage: { input_tokens: 5 } } }));
+		// then nothing, connection left open (proxy stopped relaying without closing)
+	});
+	try {
+		const t0 = Date.now();
+		await assert.rejects(
+			streamMessages(endpointUrl(srv.url, "anthropic-messages"), { "content-type": "application/json" }, "{}", new SseCollector(), new AbortController().signal, 300),
+			/no data from server for 0.3s/,
+		);
+		assert.ok(Date.now() - t0 < 3000);
+	} finally {
+		await srv.close();
+	}
+});
+
+test("background summary starts at backgroundAt of the window, clamped", () => {
+	assert.equal(backgroundStartTokens(262_144, DEFAULT_CONFIG), Math.floor(262_144 * 0.7));
+	assert.equal(backgroundStartTokens(100_000, mergeConfig({ backgroundAt: 2 })), 95_000);
+	assert.equal(backgroundStartTokens(100_000, mergeConfig({ backgroundAt: 0.1 })), 30_000);
+	assert.equal(mergeConfig({ background: "yes" as any }).background, false);
+});
+
+test("background summary is used only while summary + kept tail leave room", () => {
+	// summarized at 180k, now 240k: 60k tail + ~5k summary fits under 60% of 262k
+	assert.equal(backgroundFits(262_144, 240_000, 180_000, 20_000), true);
+	// summarized long ago: a 165k tail would leave Pi far too close to its threshold
+	assert.equal(backgroundFits(262_144, 255_000, 90_000, 20_000), false);
+	assert.equal(backgroundFits(0, 1, 0, 0), false);
+	// estimate noise (tokens now below the summary point) counts as no tail
+	assert.equal(backgroundFits(100_000, 50_000, 60_000, 4_000), true);
 });

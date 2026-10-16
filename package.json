@@ -1,7 +1,7 @@
 {
   "name": "pi-prefix-cache-compaction",
-  "version": "0.3.0",
-  "description": "Pi compaction that reuses the model server's prefix cache (vLLM, SGLang, llama.cpp, or hosted APIs with automatic caching such as DeepSeek; Anthropic Messages and OpenAI Chat Completions): no cold re-prefill of the history, plus a warm-up so the next turn starts from cache.",
+  "version": "0.5.0",
+  "description": "Pi compaction that reuses the model server's prefix cache (vLLM, SGLang, llama.cpp, or hosted APIs with automatic caching such as DeepSeek; Anthropic Messages and OpenAI Chat Completions): no cold re-prefill of the history, a warm-up so the next turn starts from cache, and an optional background mode that prepares the summary and cache before Pi compacts.",
   "type": "module",
   "license": "MIT",
   "author": "jagdeep Singh",
@@ -38,7 +38,12 @@
     "local-llm",
     "self-hosted",
     "deepseek",
-    "hosted-api"
+    "hosted-api",
+    "background-compaction",
+    "cache-warmup",
+    "context-window",
+    "long-context",
+    "omlx"
   ],
   "engines": {
     "node": ">=22.19.0"
